@@ -3,13 +3,14 @@ from datetime import datetime, timezone
 from typing import Annotated, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-from sqlalchemy import delete, func, insert, select, update
+from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.database import db, table
+from app.pagination import page
 from app.security import admin, authenticated, feature
 
 router = APIRouter(prefix='/api/v1', tags=['resources'])
@@ -28,6 +29,13 @@ class QuestionInput(Input):
     explanation: str = Field(default='', max_length=16000)
     topic: str | None = Field(default=None, max_length=300)
     image_url: str | None = Field(default=None, max_length=2000)
+    image_practice_enabled: bool = False
+
+    @model_validator(mode='after')
+    def published_image(self):
+        if self.image_practice_enabled and not self.image_url:
+            raise ValueError('Image practice requires an image')
+        return self
 
 
 class TestInput(Input):
@@ -130,9 +138,16 @@ def catalog(session: Session = Depends(db)):
 
 
 @router.get('/admin/questions', dependencies=[Depends(admin)])
-def questions(subject_id: str | None = None, limit: int = Query(500, ge=1, le=1000),
-              offset: int = Query(0, ge=0, le=1000000), session: Session = Depends(db)):
-    return list_rows(session, 'questions', limit, offset, subject_id)
+def questions(response: Response, subject_id: str | None = None, year: str | None = None,
+              limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000),
+              session: Session = Depends(db)):
+    t = table('questions')
+    statement = select(t)
+    if subject_id:
+        statement = statement.where(t.c.subject_id == subject_id)
+    if year:
+        statement = statement.where(t.c.year == year)
+    return page(session, statement.order_by(t.c.id), response, limit, offset)
 
 
 @router.get('/admin/question-counts', dependencies=[Depends(admin)])
@@ -180,8 +195,12 @@ def select_questions(body: Selection, session: Session = Depends(db)):
 
 
 @router.get('/admin/tests', dependencies=[Depends(admin)])
-def tests(limit: int = Query(500, ge=1, le=1000), offset: int = Query(0, ge=0), session: Session = Depends(db)):
-    return list_rows(session, 'tests', limit, offset)
+def tests(response: Response, include_archived: bool = False, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), session: Session = Depends(db)):
+    t = table('tests')
+    statement = select(t)
+    if not include_archived:
+        statement = statement.where(t.c.status != 'ARCHIVED')
+    return page(session, statement.order_by(t.c.created_at.desc(), t.c.id), response, limit, offset)
 
 
 @router.post('/admin/tests', status_code=201, dependencies=[Depends(admin)])
@@ -230,10 +249,13 @@ def archive_tests(body: TestArchive, session: Session = Depends(db)):
 
 
 @router.get('/admin/users', dependencies=[Depends(admin)])
-def users(limit: int = Query(500, ge=1, le=1000), offset: int = Query(0, ge=0), session: Session = Depends(db)):
+def users(response: Response, search: str = Query('', max_length=160), limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), session: Session = Depends(db)):
     u = table('app_users')
-    cols = [u.c[key] for key in ('id','name','email','mobile','college','state','role','created_at','is_active')]
-    return [dict(row) for row in session.execute(select(*cols).order_by(u.c.id).limit(limit).offset(offset)).mappings()]
+    cols = [u.c[key] for key in ('id','name','email','college','state','role','created_at','is_active')]
+    statement = select(*cols, u.c.mobile_e164.label('mobile'))
+    if search.strip():
+        statement = statement.where(or_(u.c.name.ilike(f'%{search.strip()}%'), u.c.email.ilike(f'%{search.strip()}%')))
+    return page(session, statement.order_by(u.c.created_at.desc(), u.c.id), response, limit, offset)
 
 
 @router.post('/admin/high-yield', status_code=201, dependencies=[Depends(admin)])
@@ -256,8 +278,9 @@ def create_syndrome(body: SyndromeInput, session: Session = Depends(db)):
 
 
 @router.get('/content/subject-backgrounds', dependencies=[Depends(authenticated)])
-def backgrounds(session: Session = Depends(db)):
-    return list_rows(session, 'subject_backgrounds', 500, 0)
+def backgrounds(response: Response, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), session: Session = Depends(db)):
+    t = table('subject_backgrounds')
+    return page(session, select(t).order_by(t.c.subject_name, t.c.id), response, limit, offset)
 
 
 @router.post('/admin/subject-backgrounds', status_code=201, dependencies=[Depends(admin)])
@@ -266,8 +289,9 @@ def create_background(body: BackgroundInput, session: Session = Depends(db)):
 
 
 @router.get('/content/flowcharts', dependencies=[Depends(feature('flow_charts'))])
-def flowcharts(limit: int = Query(500, ge=1, le=1000), offset: int = Query(0, ge=0), session: Session = Depends(db)):
-    return list_rows(session, 'flow_chart_questions', limit, offset)
+def flowcharts(response: Response, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), session: Session = Depends(db)):
+    t = table('flow_chart_questions')
+    return page(session, select(t).order_by(t.c.created_at.desc(), t.c.id), response, limit, offset)
 
 
 @router.post('/admin/flowcharts', status_code=201, dependencies=[Depends(admin)])

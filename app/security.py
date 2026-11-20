@@ -59,6 +59,6 @@ def feature(key: str):
 
 
 def public_user(user):
-    result = {key: user.get(key) for key in ('id', 'email', 'name', 'role', 'mobile', 'college', 'state')}
-    result['mobile'] = user.get('mobile_e164') or result['mobile']
+    result = {key: user.get(key) for key in ('id', 'email', 'name', 'role', 'college', 'state')}
+    result['mobile'] = user.get('mobile_e164')
     return result

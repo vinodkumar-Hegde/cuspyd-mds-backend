@@ -9,20 +9,17 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from fastapi.encoders import jsonable_encoder
 from pydantic import BaseModel, ConfigDict, Field
-from sqlalchemy import insert, select, or_, and_, func
+from sqlalchemy import Text, cast, exists, insert, select, or_, and_, func
 from sqlalchemy.orm import Session
 
 from app.database import db, table
+from app.pagination import page
 from app.security import authenticated, feature
 
 router = APIRouter(prefix='/api/v1', tags=['v1'])
-
-
-def active_exams():
-    return ('ACTIVE', 'PUBLISHED')
 
 
 def exam_meta(record: dict) -> dict:
@@ -32,8 +29,18 @@ def exam_meta(record: dict) -> dict:
 
 
 def available(t):
-    return or_(t.c.status.in_(active_exams()),
+    return or_(t.c.status == 'PUBLISHED',
                and_(t.c.status == 'SCHEDULED', t.c.publish_date <= func.now()))
+
+
+def image_eligible(q):
+    tests = table('tests')
+    unreleased = or_(tests.c.status.in_(('DRAFT', 'LOCKED')),
+                     and_(tests.c.status == 'SCHEDULED',
+                          or_(tests.c.publish_date.is_(None), tests.c.publish_date > func.now())))
+    reserved = exists(select(tests.c.id).where(
+        tests.c.questions.op('@>')(func.jsonb_build_array(cast(q.c.id, Text))), unreleased))
+    return and_(q.c.image_practice_enabled.is_(True), q.c.image_url.is_not(None), ~reserved)
 
 
 def question_without_answer(record: dict) -> dict:
@@ -56,16 +63,16 @@ def db_test(session: Session, exam_id: UUID) -> dict:
     if record:
         scheduled = (record['status'] == 'SCHEDULED' and record['publish_date'] and
                      record['publish_date'] <= datetime.now(timezone.utc))
-        if record['status'] not in active_exams() and not scheduled:
+        if record['status'] != 'PUBLISHED' and not scheduled:
             raise HTTPException(404, 'Exam not available')
         return dict(record)
     # Image-based practice cards use the question UUID as a virtual exam ID.
     q = table('questions')
     image = session.execute(select(q.c.id, q.c.text).where(
-        q.c.id == exam_id, q.c.image_url.is_not(None))).mappings().first()
+        q.c.id == exam_id, image_eligible(q))).mappings().first()
     if image:
         return {'id': exam_id, 'title': image['text'][:80], 'type': 'IMG',
-                'status': 'ACTIVE', 'questions': [str(exam_id)],
+                'status': 'PUBLISHED', 'questions': [str(exam_id)],
                 'created_at': None, 'admin_message': None}
     raise HTTPException(404, 'Exam not available')
 
@@ -95,33 +102,63 @@ def feature_settings(user: dict = Depends(authenticated), session: Session = Dep
 
 
 @router.get('/content/high-yield')
-def high_yield(subject_id: str | None = None, limit: int = Query(500, ge=1, le=1000), offset: int = Query(0, ge=0), user: dict = Depends(feature('high_yield')), session: Session = Depends(db)):
+def high_yield(response: Response, subject_id: str | None = None, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), user: dict = Depends(feature('high_yield')), session: Session = Depends(db)):
     t = table('high_yield_topics')
     stmt = select(t).order_by(t.c.created_at.desc(), t.c.id)
     if subject_id:
         stmt = stmt.where(t.c.subject_id == subject_id)
-    return jsonable_encoder([dict(r) for r in session.execute(stmt.limit(limit).offset(offset)).mappings()])
+    return page(session, stmt, response, limit, offset)
+
+
+@router.get('/content/high-yield/subjects')
+def high_yield_subjects(user: dict = Depends(feature('high_yield')), session: Session = Depends(db)):
+    topics = table('high_yield_topics')
+    return [dict(row) for row in session.execute(select(topics.c.subject_id, func.count().label('total'))
+                                                .group_by(topics.c.subject_id).order_by(topics.c.subject_id)).mappings()]
 
 
 @router.get('/content/syndromes')
-def syndromes(user: dict = Depends(feature('syndromes')), session: Session = Depends(db)):
+def syndromes(response: Response, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), user: dict = Depends(feature('syndromes')), session: Session = Depends(db)):
     t = table('syndromes')
-    return jsonable_encoder([dict(r) for r in session.execute(select(t).limit(200)).mappings()])
+    return page(session, select(t).order_by(t.c.name, t.c.id), response, limit, offset)
 
 
 @router.get('/exams')
-def list_exams(user: dict = Depends(feature('practice_exams')), session: Session = Depends(db)):
+def list_exams(response: Response, category: str | None = None, year: str | None = None,
+               search: str = Query('', max_length=160), limit: int = Query(50, ge=1, le=100),
+               offset: int = Query(0, ge=0, le=1000000), user: dict = Depends(feature('practice_exams')), session: Session = Depends(db)):
     t = table('tests')
-    records = session.execute(select(t).where(available(t))
-                              .order_by(t.c.created_at.desc()).limit(300)).mappings().all()
-    return jsonable_encoder([exam_meta(dict(r)) for r in records])
+    statement = select(*(t.c[key] for key in ('id', 'title', 'type', 'status', 'questions',
+                       'created_at', 'admin_message', 'subject_id', 'publish_date'))).where(available(t))
+    subjects = table('subjects')
+    if category:
+        if category not in ('ST','MT','GT','RANKER','MOCK'):
+            raise HTTPException(422, 'Unknown exam category')
+        statement = statement.where(t.c.type.in_(('MOCK','GT')) if category == 'MOCK' else t.c.type == category)
+    if year:
+        statement = statement.where(t.c.subject_id.in_(select(subjects.c.id).where(subjects.c.bds_year == year)))
+    if search.strip():
+        term = f'%{search.strip()}%'
+        statement = statement.where(or_(t.c.title.ilike(term), t.c.subject_id.in_(
+            select(subjects.c.id).where(subjects.c.name.ilike(term)))))
+    return page(session, statement.order_by(t.c.created_at.desc(), t.c.id), response, limit, offset)
 
 
 @router.get('/exams/image-based')
-def image_questions(user: dict = Depends(feature('practice_exams')), session: Session = Depends(db)):
+def image_questions(response: Response, year: str | None = None, search: str = Query('', max_length=160),
+                    limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000),
+                    user: dict = Depends(feature('practice_exams')), session: Session = Depends(db)):
     t = table('questions')
-    records = session.execute(select(t).where(t.c.image_url.is_not(None)).limit(500)).mappings().all()
-    return jsonable_encoder([question_without_answer(dict(r)) for r in records])
+    statement = select(*(t.c[key] for key in ('id', 'subject_id', 'year', 'text', 'options', 'topic', 'image_url')))
+    statement = statement.where(image_eligible(t))
+    if year:
+        statement = statement.where(t.c.year == year)
+    if search.strip():
+        subjects = table('subjects')
+        term = f'%{search.strip()}%'
+        statement = statement.where(or_(t.c.text.ilike(term), t.c.topic.ilike(term), t.c.subject_id.in_(
+            select(subjects.c.id).where(subjects.c.name.ilike(term)))))
+    return page(session, statement.order_by(t.c.id), response, limit, offset)
 
 
 @router.get('/exams/{exam_id}/questions')
@@ -154,8 +191,6 @@ def evaluate(questions: list[dict], answers: dict[str, int]) -> dict[str, Any]:
 @router.post('/exams/{exam_id}/submit')
 def submit_exam(exam_id: UUID, body: Submission, user: dict = Depends(feature('practice_exams')),
                 session: Session = Depends(db)):
-    exam = db_test(session, exam_id)
-    questions = exam_questions(session, exam)
     s = table('exam_sessions')
     # Serialize retries of one submission to avoid duplicated attempts on timeout.
     from sqlalchemy import text
@@ -163,14 +198,20 @@ def submit_exam(exam_id: UUID, body: Submission, user: dict = Depends(feature('p
                     {'key': f'submit:{user["id"]}:{body.request_id}'})
     previous = session.execute(select(s).where(s.c.user_id == user['id'], s.c.request_id == body.request_id)).mappings().first()
     if previous:
-        if str(previous['test_id'] or (previous['answers'] or {}).get('image_question_id')) != str(exam_id):
+        snapshot = previous['result_snapshot']
+        if str(snapshot['test']['id']) != str(exam_id):
             raise HTTPException(409, 'Submission identifier was used for a different exam')
-        return previous['result_snapshot']
+        if snapshot['results']['answers'] != body.answers:
+            raise HTTPException(409, 'Submission identifier was used with different answers')
+        return snapshot
+    exam = db_test(session, exam_id)
+    questions = exam_questions(session, exam)
     stats = evaluate(questions, body.answers)
     is_image = exam['type'] == 'IMG'
     stored = {**stats, 'image_question_id': str(exam_id)} if is_image else stats
     submitted_id = uuid4()
-    response = jsonable_encoder({'session_id':submitted_id, 'test': exam_meta(exam), 'results': stats,
+    response = jsonable_encoder({'schema_version':1, 'scoring_source':'server', 'review_available':True,
+                                 'session_id':submitted_id, 'test': exam_meta(exam), 'results': stats,
                                  'questions': [question_for_review(q) for q in questions]})
     try:
         session.execute(insert(s).values(
@@ -186,23 +227,13 @@ def submit_exam(exam_id: UUID, body: Submission, user: dict = Depends(feature('p
 
 
 @router.get('/exams/history')
-def exam_history(user: dict = Depends(feature('test_history')), session: Session = Depends(db)):
+def exam_history(response: Response, limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0, le=1000000), user: dict = Depends(feature('test_history')), session: Session = Depends(db)):
     s = table('exam_sessions')
-    t = table('tests')
-    rows = session.execute(select(s, t.c.title.label('test_title'), t.c.type.label('test_type'),
-                                  t.c.questions.label('test_questions'))
-                           .outerjoin(t, t.c.id == s.c.test_id)
-                           .where(s.c.user_id == user['id'])
-                           .order_by(s.c.start_time.desc()).limit(200)).mappings().all()
-    return jsonable_encoder([{
-        **{k: r[k] for k in s.c.keys()},
-        'tests': ({'id': r['test_id'], 'title': r['test_title'],
-                   'type': r['test_type'], 'questions': r['test_questions']}
-                  if r['test_id'] else
-                  {'id': (r['answers'] or {}).get('image_question_id'),
-                   'title': 'Image-based practice', 'type': 'IMG',
-                   'questions': [(r['answers'] or {}).get('image_question_id')]})
-    } for r in rows])
+    statement = select(s.c.id, s.c.type, s.c.start_time, s.c.end_time, s.c.is_completed,
+                       s.c.result_snapshot['test'].label('test'),
+                       s.c.result_snapshot['results']['score'].label('score'))
+    return page(session, statement.where(s.c.user_id == user['id'], s.c.is_completed.is_(True))
+                .order_by(s.c.start_time.desc(), s.c.id), response, limit, offset)
 
 
 @router.get('/exams/history/{session_id}/result')
@@ -212,18 +243,9 @@ def exam_history_result(session_id: UUID, user: dict = Depends(feature('test_his
     record = session.execute(select(s).where(s.c.id == session_id, s.c.user_id == user['id'])).mappings().first()
     if not record or not record['is_completed']:
         raise HTTPException(404, 'Completed exam not available')
-    if record['result_snapshot']:
-        return record['result_snapshot']
-    stored = record['answers'] or {}
-    exam_id = record['test_id'] or stored.get('image_question_id')
-    if not exam_id:
-        raise HTTPException(404, 'Exam details unavailable')
-    exam = db_test(session, UUID(str(exam_id)))
-    qs = exam_questions(session, exam)
-    payload = record['answers'] or {}
-    result = payload.get('results') if isinstance(payload, dict) and 'results' in payload else payload
-    return jsonable_encoder({'test': exam_meta(exam), 'results': result,
-                            'questions': [question_for_review(q) for q in qs]})
+    if not record['result_snapshot']:
+        raise HTTPException(503, 'Result temporarily unavailable')
+    return record['result_snapshot']
 
 # AI calls are backend-only. Configurable model and key are kept out of Vite.
 class QuestionGenerationRequest(BaseModel):
@@ -235,7 +257,7 @@ class QuestionGenerationRequest(BaseModel):
 def ask_gemini(prompt: str) -> str:
     import os
     import re
-    import httpx
+    import httpx2
     key = os.environ.get('GEMINI_API_KEY')
     if not key:
         raise HTTPException(503, 'AI provider not configured on backend')
@@ -243,15 +265,18 @@ def ask_gemini(prompt: str) -> str:
     if not re.fullmatch(r'[a-zA-Z0-9._-]{1,80}', model):
         raise HTTPException(503, 'Invalid AI model configuration')
     try:
-        response = httpx.post(
+        response = httpx2.post(
             f'https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent',
             headers={'x-goog-api-key': key, 'Content-Type': 'application/json'},
             json={'contents': [{'parts': [{'text': prompt[:12000]}]}]},
             timeout=45,
         )
         response.raise_for_status()
-        return response.json()['candidates'][0]['content']['parts'][0]['text']
-    except (httpx.HTTPError, KeyError, IndexError, ValueError):
+        result = response.json()['candidates'][0]['content']['parts'][0]['text']
+        if not isinstance(result, str) or not result.strip() or len(result) > 200000:
+            raise ValueError('Invalid provider text')
+        return result
+    except (httpx2.HTTPError, KeyError, IndexError, ValueError, TypeError):
         raise HTTPException(502, 'AI provider request failed') from None
 
 
@@ -288,13 +313,19 @@ def ai_generate_questions(body: QuestionGenerationRequest,
         if not isinstance(result, list) or len(result) != body.count:
             raise ValueError('Invalid generated array')
         from app.resources import QuestionInput
+        normalized = []
         for item in result:
-            QuestionInput(subject_id=body.subjectId, year=body.year, text=item.get('text'),
+            if not isinstance(item, dict):
+                raise ValueError('Invalid question object')
+            validated = QuestionInput(subject_id=body.subjectId, year=body.year, text=item.get('text'),
                           options=item.get('options'), correct_option=item.get('correctOption'),
                           explanation=item.get('explanation', ''), topic=item.get('topic'))
+            normalized.append({'text':validated.text, 'options':validated.options,
+                               'correctOption':validated.correct_option,
+                               'explanation':validated.explanation, 'topic':validated.topic})
     except (ValueError, TypeError):
         raise HTTPException(502, 'AI returned invalid question data') from None
-    return {'questions': result}
+    return {'questions': normalized}
 
 
 # AI flowchart generation is admin-only and runs exclusively on FastAPI.
@@ -326,7 +357,8 @@ def ai_generate_flowchart(body: FlowchartGenerationRequest,
         if (not isinstance(result, dict) or
             not isinstance(result.get('nodes'), list) or
             not isinstance(result.get('edges'), list) or
-            len(result['nodes']) > 100 or len(result['edges']) > 250):
+            len(result['nodes']) > 100 or len(result['edges']) > 250 or
+            any(not isinstance(item, dict) for item in result['nodes'] + result['edges'])):
             raise ValueError('Invalid flowchart')
     except (ValueError, TypeError):
         raise HTTPException(502, 'AI returned an invalid flowchart') from None

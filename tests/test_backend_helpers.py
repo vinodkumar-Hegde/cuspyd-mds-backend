@@ -12,7 +12,7 @@ def test_csv_formula_injection():
 def test_nested_scores():
     score={'score':8,'correct':2,'wrong':0,'unattempted':1}
     assert score_from_payload(score)['score']==8
-    assert score_from_payload({'results':score})['correct']==2
+    assert score_from_payload({'results':score}) is None
     assert score_from_payload({'wrong':'bad'}) is None
     assert score_from_payload(None) is None
     assert score_from_payload({'score':float('nan'),'correct':0,'wrong':0,'unattempted':0}) is None

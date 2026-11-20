@@ -16,7 +16,7 @@ app = FastAPI(title='MDSLate API', version='1.0.0')
 app.add_middleware(CORSMiddleware, allow_origins=settings().origins,
                    allow_methods=['GET', 'POST', 'PATCH', 'DELETE'],
                    allow_headers=['Authorization', 'Content-Type', 'Idempotency-Key'],
-                   expose_headers=['Content-Disposition', 'X-Request-ID'])
+                   expose_headers=['Content-Disposition', 'X-Request-ID', 'X-Total-Count'])
 
 
 @app.middleware('http')
@@ -53,7 +53,7 @@ def health():
 def ready():
     with Sessions() as session:
         session.execute(text('SELECT 1 FROM public.schema_migrations WHERE version=:version'),
-                        {'version': '008_production.sql'}).scalar_one()
+                        {'version': '009_canonical_runtime.sql'}).scalar_one()
     return {'ok': True}
 
 

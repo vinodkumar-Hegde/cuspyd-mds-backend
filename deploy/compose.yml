@@ -1,0 +1,58 @@
+# Deployment baseline for two independently published images and an external DB.
+# Complete docs/RELEASE_CHECKLIST.md before public rollout.
+name: mdslate
+services:
+  migrate:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE to an immutable image reference}
+    env_file:
+      - ${MIGRATION_ENV_FILE:?Set an absolute migration-owner environment file path}
+    volumes:
+      - ${DB_CA_FILE:?Set the absolute DB CA bundle path}:/run/secrets/db-ca.pem:ro
+    command: ["python", "-m", "app.migrate"]
+    restart: "no"
+    init: true
+    healthcheck:
+      disable: true
+  api:
+    image: ${BACKEND_IMAGE:?Set BACKEND_IMAGE to an immutable image reference}
+    env_file:
+      - ${RUNTIME_ENV_FILE:?Set an absolute API environment file path}
+    environment:
+      UPLOAD_DIR: /app/uploads
+      FORWARDED_ALLOW_IPS: ${FRONTEND_PROXY_IP:-10.211.24.10}
+    networks: [default, proxy]
+    volumes:
+      - uploads:/app/uploads
+      - ${DB_CA_FILE:?Set the absolute DB CA bundle path}:/run/secrets/db-ca.pem:ro
+    restart: unless-stopped
+    init: true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+  frontend:
+    image: ${FRONTEND_IMAGE:?Set FRONTEND_IMAGE to an immutable image reference}
+    environment:
+      API_UPSTREAM: http://api:8000
+      TRUSTED_INGRESS_CIDR: ${TRUSTED_INGRESS_CIDR:-127.0.0.1/32}
+    networks:
+      proxy:
+        ipv4_address: ${FRONTEND_PROXY_IP:-10.211.24.10}
+    ports:
+      - "${HTTP_BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"
+    restart: unless-stopped
+    init: true
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+volumes:
+  uploads:
+networks:
+  proxy:
+    ipam:
+      config:
+        - subnet: ${PROXY_NETWORK_CIDR:-10.211.24.0/24}

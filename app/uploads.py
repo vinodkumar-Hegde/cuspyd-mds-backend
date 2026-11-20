@@ -1,16 +1,18 @@
 """Bounded, validated file uploads; the API owns filenames and storage paths."""
 import io
+from pathlib import Path
 import re
 import uuid
 import warnings
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from PIL import Image, UnidentifiedImageError
 from starlette.concurrency import run_in_threadpool
 
 from app.config import settings
 from app.security import admin
+from app.storage import image_source, save_image, StorageUnavailable
 
 router = APIRouter(prefix='/api/uploads', tags=['uploads'])
 BUCKETS = frozenset({'high-yield', 'subject-backgrounds', 'question-images', 'syndromes'})
@@ -41,9 +43,9 @@ async def upload(bucket: str, file: UploadFile = File(...), actor: dict = Depend
                 raise HTTPException(413, 'File exceeds the upload size limit')
         await run_in_threadpool(validate_image, bytes(blob), file.content_type)
         name = uuid.uuid4().hex + TYPES[file.content_type][1]
-        directory = settings().upload_dir
-        await run_in_threadpool(directory.mkdir, parents=True, exist_ok=True)
-        await run_in_threadpool((directory / name).write_bytes, blob)
+        await run_in_threadpool(save_image, name, bytes(blob), file.content_type, bucket)
+    except StorageUnavailable:
+        raise HTTPException(503, 'Image storage temporarily unavailable') from None
     finally:
         await file.close()
     return {'path': name, 'publicUrl': f'/api/uploads/{name}'}
@@ -53,7 +55,12 @@ async def upload(bucket: str, file: UploadFile = File(...), actor: dict = Depend
 def serve_upload(name: str):
     if not re.fullmatch(r'[0-9a-f]{32}\.(png|jpg|webp|pdf)', name):
         raise HTTPException(404, 'File not found')
-    path = settings().upload_dir / name
-    if not path.is_file():
+    try:
+        source = image_source(name)
+    except FileNotFoundError:
         raise HTTPException(404, 'File not found')
-    return FileResponse(path, headers={'X-Content-Type-Options': 'nosniff'})
+    except StorageUnavailable:
+        raise HTTPException(503, 'Image storage temporarily unavailable') from None
+    if isinstance(source, Path):
+        return FileResponse(source, headers={'X-Content-Type-Options': 'nosniff'})
+    return RedirectResponse(source, status_code=307, headers={'Cache-Control': 'no-store'})

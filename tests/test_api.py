@@ -4,92 +4,18 @@ import os
 import smtplib
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta, timezone
 
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
-from sqlalchemy import inspect, text
-from sqlalchemy.engine import make_url
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 from app import auth_email
 from app.database import engine
-from app.main import app
 from app.migrate import migrate
-from app.security import issue_token, password_hash
 
 pytestmark = pytest.mark.skipif(not os.getenv('TEST_DATABASE_URL'), reason='Set TEST_DATABASE_URL to a disposable PostgreSQL database')
-PASSWORD = 'A-real-test-password-123!'
-RESET_TEST_DATA = '''TRUNCATE public.app_users, public.questions, public.tests, public.auth_email_challenges, public.auth_pending_registrations, public.auth_otp_rate_events, public.high_yield_topics, public.flow_chart_questions, public.syndromes, public.subject_backgrounds RESTART IDENTITY CASCADE'''
-
-
-@pytest.fixture(scope='module', autouse=True)
-def database():
-    if not os.getenv('TEST_DATABASE_URL'):
-        return
-    assert make_url(engine.url).database.endswith('_test'), 'Refusing to modify a non-test database'
-    if inspect(engine).has_table('app_users', schema='public'):
-        with engine.begin() as connection:
-            connection.execute(text('TRUNCATE public.app_users CASCADE'))
-    migrate()
-    migrate()  # Re-running does not replay migrations.
-
-
-@pytest.fixture
-def client(monkeypatch, tmp_path):
-    with engine.begin() as connection:
-        connection.execute(text(RESET_TEST_DATA))
-    with engine.begin() as connection:
-        connection.execute(text('UPDATE public.feature_settings SET is_visible=true'))
-    monkeypatch.setenv('OTP_SECRET', 'test-otp-secret-with-more-than-32-characters')
-    monkeypatch.setattr(auth_email, 'mail_configuration', lambda: ('test', 587, 'sender@example.org', 'starttls', '', ''))
-    sent = []
-    monkeypatch.setattr(auth_email, 'send_email', lambda email, code, purpose: sent.append((email, code, purpose)))
-    from app.config import settings
-    monkeypatch.setattr(settings(), 'upload_dir', tmp_path)
-    with TestClient(app) as test_client:
-        test_client.sent = sent
-        try:
-            yield test_client
-        finally:
-            with engine.begin() as connection:
-                connection.execute(text(RESET_TEST_DATA))
-
-
-def details(email='student@example.org', mobile='9876543210'):
-    return {'name':'Test Student', 'email':email, 'password':PASSWORD,
-            'mobile':mobile, 'college':'Test College', 'state':'Test State'}
-
-
-def register(client, email='student@example.org', mobile='9876543210'):
-    response = client.post('/api/auth/register/request', json=details(email, mobile))
-    assert response.status_code == 202, response.text
-    code = next(code for address, code, purpose in reversed(client.sent) if address == email.lower() and purpose == 'register')
-    return client.post('/api/auth/register/verify', json={'email':email, 'code':code})
-
-
-def account(role='student', email=None, mobile=None):
-    uid = uuid.uuid4()
-    with engine.begin() as connection:
-        connection.execute(text('''INSERT INTO public.app_users (id,email,name,password_hash,role,mobile,mobile_e164)
-            VALUES (:id,:email,'Test account',:hash,:role,:mobile,:mobile)'''),
-            {'id':uid,'email':email or f'{uid}@example.org','hash':password_hash.hash(PASSWORD), 'role':role, 'mobile':mobile})
-    return uid, {'Authorization':f'Bearer {issue_token(str(uid))}'}
-
-
-def exam(client, admin_headers, status='PUBLISHED', image=False):
-    question = {'subject_id':'anatomy','year':'BDS-I','text':'A sample question?',
-                'options':['A','B','C','D'],'correct_option':1,'explanation':'Explanation',
-                'image_url':'https://example.org/question.png' if image else None}
-    response = client.post('/api/v1/admin/questions', json=[question], headers=admin_headers)
-    assert response.status_code == 201, response.text
-    question_id = response.json()[0]['id']
-    response = client.post('/api/v1/admin/tests', json={'title':'Sample exam','type':'RANKER',
-        'status':status, 'questions':[question_id], 'subject_id':'anatomy',
-        **({'publish_date':(datetime.now(timezone.utc)+timedelta(hours=1)).isoformat()} if status == 'SCHEDULED' else {})}, headers=admin_headers)
-    assert response.status_code == 201, response.text
-    return response.json()['id'], question_id
+from factories import PASSWORD, account, details, exam, register
 
 
 def test_complete_registration_login_and_profile(client):
@@ -101,7 +27,7 @@ def test_complete_registration_login_and_profile(client):
     assert identity.json()['role'] == 'student'
     assert 'password_hash' not in identity.json()
     with engine.connect() as connection:
-        assert connection.execute(text('SELECT count(*) FROM public.profiles')).scalar_one() == 1
+        assert connection.execute(text('SELECT count(*) FROM public.app_users')).scalar_one() == 1
 
 
 def test_duplicate_email_case_insensitive(client):
@@ -274,6 +200,117 @@ def test_upload_uses_server_filename_and_validates_content(client):
     assert client.post('/api/uploads/syndromes',files={'file':('x.png',blob.getvalue(),'image/png')},headers=student).status_code == 403
 
 
+@pytest.fixture
+def s3_storage(client, monkeypatch):
+    import boto3
+    from botocore.config import Config
+    from botocore.stub import Stubber
+    from app import storage
+    from app.config import settings
+
+    cfg = settings()
+    for field, value in {'storage_backend':'s3', 's3_bucket':'test-media-bucket',
+                         's3_prefix':'staging/images', 's3_presign_seconds':120,
+                         's3_kms_key_id':''}.items():
+        monkeypatch.setattr(cfg, field, value)
+    sdk = boto3.client('s3', region_name='ap-south-1',
+                       aws_access_key_id='test-only-key', aws_secret_access_key='test-only-secret',
+                       config=Config(signature_version='s3v4'))
+    monkeypatch.setattr(storage, 's3_client', lambda: sdk)
+    with Stubber(sdk) as stub:
+        yield stub
+        stub.assert_no_pending_responses()
+
+
+def test_s3_upload_keeps_stable_url_and_reads_with_expiring_signature(client, s3_storage):
+    from botocore.stub import ANY
+    from urllib.parse import parse_qs, urlsplit
+    from app.config import settings
+
+    _, headers = account('admin')
+    blob = io.BytesIO()
+    Image.new('RGB', (2, 2), 'blue').save(blob, format='PNG')
+    s3_storage.add_response('put_object', {}, {
+        'Bucket':'test-media-bucket', 'Key':ANY, 'Body':blob.getvalue(),
+        'ContentType':'image/png', 'Metadata':{'category':'syndromes'},
+    })
+    response = client.post('/api/uploads/syndromes', headers=headers,
+                           files={'file':('original.png', blob.getvalue(), 'image/png')})
+    assert response.status_code == 201, response.text
+    body = response.json()
+    assert body['publicUrl'] == f'/api/uploads/{body["path"]}'
+    assert not list(settings().upload_dir.iterdir()), 'S3 uploads must not silently write local copies'
+    s3_storage.add_response('head_object', {}, {
+        'Bucket':'test-media-bucket', 'Key':f'staging/images/{body["path"]}',
+    })
+    media = client.get(body['publicUrl'], follow_redirects=False)
+    assert media.status_code == 307
+    signed = urlsplit(media.headers['location'])
+    assert signed.scheme == 'https'
+    assert signed.path.endswith(f'/staging/images/{body["path"]}')
+    assert parse_qs(signed.query)['X-Amz-Expires'] == ['120']
+    assert 'no-store' in media.headers['cache-control']
+    assert 'X-Amz-' not in response.text
+
+
+def test_s3_mode_preserves_existing_local_images(client, s3_storage):
+    from app.config import settings
+    name = f'{uuid.uuid4().hex}.png'
+    (settings().upload_dir / name).write_bytes(b'legacy-image-content')
+    response = client.get(f'/api/uploads/{name}', follow_redirects=False)
+    assert response.status_code == 200
+    assert response.content == b'legacy-image-content'
+
+
+def test_s3_failure_is_controlled_and_does_not_fall_back_to_local(client, s3_storage):
+    from app.config import settings
+    _, headers = account('admin')
+    blob = io.BytesIO()
+    Image.new('RGB', (2, 2)).save(blob, format='PNG')
+    s3_storage.add_client_error('put_object', service_error_code='AccessDenied',
+                                service_message='private-provider-details', http_status_code=403)
+    response = client.post('/api/uploads/syndromes', headers=headers,
+                           files={'file':('x.png', blob.getvalue(), 'image/png')})
+    assert response.status_code == 503
+    assert 'private-provider-details' not in response.text
+    assert 'publicUrl' not in response.json()
+    assert not list(settings().upload_dir.iterdir())
+
+
+def test_s3_missing_object_and_provider_denial_have_controlled_responses(client, s3_storage):
+    url = f'/api/uploads/{uuid.uuid4().hex}.png'
+    s3_storage.add_client_error('head_object', service_error_code='404', http_status_code=404)
+    assert client.get(url, follow_redirects=False).status_code == 404
+    s3_storage.add_client_error('head_object', service_error_code='AccessDenied', http_status_code=403)
+    assert client.get(url, follow_redirects=False).status_code == 503
+
+
+def test_s3_validation_and_authorization_happen_before_storage(client, s3_storage, monkeypatch):
+    from app.config import settings
+    _, admin_headers = account('admin')
+    _, student_headers = account()
+    def send(data, headers):
+        return client.post('/api/uploads/syndromes', headers=headers,
+                           files={'file':('x.png', data, 'image/png')})
+    assert send(b'corrupt', admin_headers).status_code == 422
+    assert send(b'corrupt', student_headers).status_code == 403
+    monkeypatch.setattr(settings(), 'max_upload_bytes', 1024)
+    assert send(b'x' * 1025, admin_headers).status_code == 413
+
+
+def test_local_disk_failure_returns_controlled_storage_error(client, monkeypatch, tmp_path):
+    from app.config import settings
+    _, headers = account('admin')
+    invalid_directory = tmp_path / 'not-a-directory'
+    invalid_directory.write_text('occupied')
+    monkeypatch.setattr(settings(), 'upload_dir', invalid_directory)
+    blob = io.BytesIO()
+    Image.new('RGB', (2, 2)).save(blob, format='PNG')
+    response = client.post('/api/uploads/syndromes', headers=headers,
+                           files={'file':('x.png', blob.getvalue(), 'image/png')})
+    assert response.status_code == 503
+
+
 def test_import_rejects_missing_answers_instead_of_guessing(client):
     _, headers = account('admin')
     def preview(data):
@@ -369,8 +406,13 @@ def test_migration_refuses_duplicate_legacy_identity_without_deleting(client):
     account(email='one@example.org', mobile='+919876543210')
     with engine.begin() as connection:
         connection.execute(text("INSERT INTO public.app_users (id,email,name,mobile) VALUES (:id,'legacy@example.org','Legacy','98765 43210')"), {'id':uuid.uuid4()})
-    with pytest.raises(RuntimeError, match='Duplicate legacy'):
-        migrate()
+        connection.execute(text("DELETE FROM public.schema_migrations WHERE version='008_production.sql'"))
+    try:
+        with pytest.raises(RuntimeError, match='Duplicate legacy'):
+            migrate()
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text("INSERT INTO public.schema_migrations (version) VALUES ('008_production.sql')"))
     with engine.connect() as connection:
         assert connection.execute(text('SELECT count(*) FROM public.app_users')).scalar_one() == 2
 

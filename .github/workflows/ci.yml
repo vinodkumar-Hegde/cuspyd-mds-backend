@@ -1,0 +1,19 @@
+name: Backend CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lint and test against disposable PostgreSQL
+        run: docker compose -p mdslate-backend-ci -f deploy/compose.test.yml run --build --rm test
+      - name: Build runtime image
+        run: docker build --target runtime -t cuspyd-mds-backend:ci .
+      - name: Remove disposable test stack
+        if: always()
+        run: docker compose -p mdslate-backend-ci -f deploy/compose.test.yml down --volumes --remove-orphans

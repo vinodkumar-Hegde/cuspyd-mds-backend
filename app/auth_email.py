@@ -215,13 +215,13 @@ def rate_limit(session: Session, email: str, ip: str, action: str, *, cooldown: 
 
 def eligible_student(account: dict | None) -> bool:
     return bool(account and account['role'] == 'student' and
-                (account.get('legacy_role') or '').lower() != 'admin' and
+                account['email_recovery_allowed'] and
                 (account['is_active'] or account['password_reset_required']))
 
 
 def get_user(session: Session, email: str):
     result = session.execute(text('''
-        SELECT id, role, legacy_role, is_active, password_reset_required
+        SELECT id, role, email_recovery_allowed, is_active, password_reset_required
         FROM public.app_users WHERE lower(btrim(email))=:email
     '''), {'email': email}).mappings().first()
     return dict(result) if result else None
@@ -341,15 +341,10 @@ def verify_registration(body: RegisterConfirm, request: Request, session: Sessio
                 uid = uuid.uuid4()
                 session.execute(text('''
                   INSERT INTO public.app_users
-                    (id,email,password_hash,name,mobile,mobile_e164,college,state,role,is_active,password_reset_required,token_version)
-                  VALUES (:id,:email,:hash,:name,:mobile,:mobile,:college,:state,'student',true,false,0)
+                    (id,email,password_hash,name,mobile_e164,college,state,role,is_active,password_reset_required,token_version)
+                  VALUES (:id,:email,:hash,:name,:mobile,:college,:state,'student',true,false,0)
                 '''), {'id': uid, 'email': email, 'hash': pending['password_hash'],
                        'name': pending['name'], 'mobile': pending['mobile'], 'college': pending['college'], 'state': pending['state']})
-                session.execute(text('''
-                  INSERT INTO public.profiles (id,name,email,mobile,college,state,role)
-                  VALUES (:id,:name,:email,:mobile,:college,:state,'student')
-                '''), {'id': uid, 'name': pending['name'], 'email': email,
-                       'mobile': pending['mobile'], 'college': pending['college'], 'state': pending['state']})
                 mark_consumed(session, email, 'register')
                 session.execute(text('DELETE FROM public.auth_pending_registrations WHERE email=:email'), {'email': email})
                 verified = True
@@ -394,7 +389,7 @@ def confirm_password_reset(body: ResetConfirm, request: Request, session: Sessio
                   UPDATE public.app_users SET password_hash=:hash, is_active=true,
                      password_reset_required=false, token_version=token_version + 1
                   WHERE lower(btrim(email))=:email AND role='student'
-                    AND lower(coalesce(legacy_role, 'student')) <> 'admin'
+                    AND email_recovery_allowed=true
                     AND (is_active OR password_reset_required)
                 '''), {'email': email, 'hash': hash_student_password(body.new_password)})
                 reset = result.rowcount == 1

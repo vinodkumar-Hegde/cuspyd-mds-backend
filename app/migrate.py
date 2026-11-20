@@ -18,9 +18,11 @@ def migrate():
     with engine.begin() as connection:
         connection.execute(text("SELECT pg_advisory_xact_lock(hashtextextended('mdslate:migrations', 0))"))
         tables = inspect(connection).get_table_names(schema='public')
+        connection.execute(text('CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())'))
+        applied = set(connection.execute(text('SELECT version FROM public.schema_migrations')).scalars())
         canonical = []
         invalid_mobile_count = 0
-        if 'app_users' in tables:
+        if 'app_users' in tables and '008_production.sql' not in applied:
             users = connection.execute(text('SELECT id, email, mobile FROM public.app_users')).mappings().all()
             emails, mobiles = set(), set()
             for user in users:
@@ -38,14 +40,15 @@ def migrate():
                 canonical.append({'id': user['id'], 'mobile': mobile})
         if invalid_mobile_count:
             log.warning('%d invalid legacy mobile values preserved unchanged without canonical phone keys; new registration validation remains strict', invalid_mobile_count)
-        connection.execute(text('CREATE TABLE IF NOT EXISTS public.schema_migrations (version text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())'))
-        applied = set(connection.execute(text('SELECT version FROM public.schema_migrations')).scalars())
         for path in sorted((Path(__file__).resolve().parents[1] / 'sql').glob('*.sql')):
             if path.name in applied:
                 continue
             connection.exec_driver_sql(path.read_text())
             if path.name == '008_production.sql' and canonical:
                 connection.execute(text('UPDATE public.app_users SET mobile_e164=:mobile WHERE id=:id'), canonical)
+            if path.name == '009_canonical_runtime.sql':
+                from migrations.canonical import migrate as canonical_runtime
+                canonical_runtime(connection)
             connection.execute(text('INSERT INTO public.schema_migrations (version) VALUES (:version)'), {'version': path.name})
             print(f'Applied {path.name}')
     table.cache_clear()

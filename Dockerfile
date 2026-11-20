@@ -4,6 +4,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY sql ./sql
+COPY migrations ./migrations
 ENV UPLOAD_DIR=/app/uploads PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 RUN mkdir -p /app/uploads && useradd -r -u 10001 appuser && chown -R appuser /app/uploads
 USER appuser

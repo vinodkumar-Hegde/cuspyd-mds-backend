@@ -9,9 +9,9 @@ from app.config import settings
 engine = create_engine(settings().database_url, pool_pre_ping=True, pool_recycle=1800,
                        connect_args={'options': '-c statement_timeout=15000 -c lock_timeout=5000'})
 Sessions = sessionmaker(engine, expire_on_commit=False)
-TABLES = frozenset({'app_users', 'profiles', 'questions', 'tests', 'exam_sessions',
+TABLES = frozenset({'app_users', 'questions', 'tests', 'exam_sessions',
                    'feature_settings', 'high_yield_topics', 'subject_backgrounds',
-                   'flow_chart_questions', 'syndromes', 'subjects', 'app_settings'})
+                   'flow_chart_questions', 'syndromes', 'subjects'})
 
 
 def db():

@@ -1,7 +1,7 @@
 """Read-only analytics and explicitly authorized exports for MDSLate.
 
-This module is independent from the legacy generic data adapter. It uses the
-existing PG16 schema and never needs browser database credentials.
+Statistics read canonical result snapshots. Administrator exports use fixed
+dataset/column allowlists and never expose credentials.
 """
 from __future__ import annotations
 
@@ -54,9 +54,8 @@ def safe_cell(value: Any) -> str:
 def score_from_payload(payload: Any) -> dict[str, float] | None:
     if not isinstance(payload, dict):
         return None
-    body = payload.get('results') if isinstance(payload.get('results'), dict) else payload
     try:
-        out = {k:float(body[k]) for k in ('score', 'correct','wrong','unattempted')}
+        out = {k:float(payload[k]) for k in ('score', 'correct','wrong','unattempted')}
     except (TypeError, ValueError, KeyError, OverflowError):
         return None
     if any(not (-100000 <= v <= 100000) for v in out.values()):
@@ -80,17 +79,18 @@ def stats_overview(user: dict = Depends(authenticated), session: Session = Depen
         questions = scalar(session, 'SELECT count(*) FROM public.questions')
         image_questions = scalar(session, 'SELECT count(*) FROM public.questions WHERE image_url IS NOT NULL')
         tests_total = scalar(session, 'SELECT count(*) FROM public.tests')
-        active_tests = scalar(session, "SELECT count(*) FROM public.tests WHERE status IN ('ACTIVE','PUBLISHED')")
+        active_tests = scalar(session, "SELECT count(*) FROM public.tests WHERE status='PUBLISHED' OR (status='SCHEDULED' AND publish_date<=now())")
         subjects_total = scalar(session, 'SELECT count(DISTINCT subject_id) FROM public.questions')
         # Only current user's completed sessions, not all students' exam answers.
         completed = scalar(session, 'SELECT count(*) FROM public.exam_sessions WHERE user_id=:uid AND is_completed=true', {'uid': uid})
         recent = rows(session, '''
-            SELECT id, type, COALESCE(end_time,start_time) AS completed_at, answers
+            SELECT id, type, COALESCE(end_time,start_time) AS completed_at,
+                   result_snapshot->'results' AS results, result_snapshot->>'scoring_source' AS scoring_source
             FROM public.exam_sessions
             WHERE user_id=:uid AND is_completed=true
             ORDER BY COALESCE(end_time,start_time) DESC LIMIT 500
         ''', {'uid':uid})
-        scored = [m for r in recent if (m:=score_from_payload(r['answers'])) is not None]
+        scored = [m for r in recent if r['scoring_source']=='server' and (m:=score_from_payload(r['results'])) is not None]
         score_avg = round(sum(s['score'] for s in scored)/len(scored), 1) if scored else None
         denominator = sum(s['correct']+s['wrong']+s['unattempted'] for s in scored)
         accuracy = round(100*sum(s['correct'] for s in scored)/denominator, 1) if denominator else None
@@ -114,7 +114,7 @@ def stats_overview(user: dict = Depends(authenticated), session: Session = Depen
             'my_activity_7d':[{'date':k,'attempts':v} for k,v in days.items()],
             'my_recent_exams':[{'id':str(r['id']), 'type':r['type'], 'completed_at':r['completed_at'],
                                'score':(s or {}).get('score')}
-                              for r in recent[:5] for s in [score_from_payload(r['answers'])]],
+                              for r in recent[:5] for s in [score_from_payload(r['results'])]],
             'metrics_sample_size':len(scored),
             'is_admin':user['role']=='admin',
         }
@@ -223,9 +223,9 @@ def admin_activity(actor: dict = Depends(admin), session: Session = Depends(db))
     try:
         result=rows(session, '''
             SELECT e.id, e.type, e.is_completed, e.start_time, e.end_time,
-                   p.name AS student_name, p.email AS student_email
+                   u.name AS student_name, u.email AS student_email
             FROM public.exam_sessions e
-            LEFT JOIN public.profiles p ON p.id=e.user_id
+            LEFT JOIN public.app_users u ON u.id=e.user_id
             ORDER BY e.start_time DESC LIMIT 200
         ''')
         return jsonable_encoder(result)
@@ -237,7 +237,7 @@ def admin_activity(actor: dict = Depends(admin), session: Session = Depends(db))
 def performance_summary(user: dict, session: Session) -> dict:
     data = rows(session, '''
         SELECT result_snapshot FROM public.exam_sessions
-        WHERE user_id=:uid AND is_completed=true AND result_snapshot IS NOT NULL
+        WHERE user_id=:uid AND is_completed=true AND result_snapshot->>'scoring_source'='server'
         ORDER BY end_time DESC LIMIT 500
     ''', {'uid': user['id']})
     subjects: dict[str, dict] = {}
@@ -269,7 +269,7 @@ def leaderboard(user: dict = Depends(authenticated), session: Session = Depends(
         WITH best AS (
             SELECT user_id, max((result_snapshot->'results'->>'score')::integer) AS score
             FROM public.exam_sessions
-            WHERE type='RANKER' AND is_completed=true AND result_snapshot IS NOT NULL
+            WHERE type='RANKER' AND is_completed=true AND result_snapshot->>'scoring_source'='server'
             GROUP BY user_id
         )
         SELECT dense_rank() OVER (ORDER BY b.score DESC) AS rank,

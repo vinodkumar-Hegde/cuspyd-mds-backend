@@ -2,9 +2,9 @@
 import re
 import os
 import uuid
-import httpx
+import httpx2
 
-with httpx.Client(base_url=os.getenv('SMOKE_WEB_URL', 'http://127.0.0.1:3002'), timeout=30) as client:
+with httpx2.Client(base_url=os.getenv('SMOKE_WEB_URL', 'http://127.0.0.1:3002'), timeout=30) as client:
     index = client.get('/')
     assert index.status_code == 200
     assert 'content-security-policy' in index.headers
@@ -36,5 +36,5 @@ with httpx.Client(base_url=os.getenv('SMOKE_WEB_URL', 'http://127.0.0.1:3002'), 
     registration.update(email='unused@smoke.example.org',mobile='+91 98765 43211')
     assert client.post('/api/auth/register/request',json=registration).status_code == 409
     print('Frontend asset delivery, security headers, API proxy, login, permissions, scoring, result history, logout and duplicate registration passed.')
-assert httpx.get(os.getenv('SMOKE_API_URL', 'http://127.0.0.1:18001') + '/ready').json() == {'ok':True}
+assert httpx2.get(os.getenv('SMOKE_API_URL', 'http://127.0.0.1:18001') + '/ready').json() == {'ok':True}
 print('Separate API readiness passed.')

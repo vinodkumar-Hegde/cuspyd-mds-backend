@@ -27,9 +27,9 @@ def main():
         raise SystemExit('Password confirmation or length is invalid')
     uid = uuid.uuid4()
     with Sessions.begin() as session:
-        identity = {'id':uid,'email':email,'name':args.name.strip(),'mobile':mobile,'role':'admin'}
-        session.execute(insert(table('app_users')).values(**identity, mobile_e164=mobile, password_hash=password_hash.hash(password)))
-        session.execute(insert(table('profiles')).values(**identity))
+        identity = {'id':uid,'email':email,'name':args.name.strip(),'mobile_e164':mobile,'role':'admin'}
+        session.execute(insert(table('app_users')).values(**identity, email_recovery_allowed=False,
+                                                       password_hash=password_hash.hash(password)))
     print('Administrator created. No default password was stored in source code.')
 
 
